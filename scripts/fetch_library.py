@@ -138,6 +138,12 @@ def rd_request(endpoint: str, params: dict | None = None, retries: int = MAX_RET
                 time.sleep(wait)
                 continue
 
+            if resp.status_code == 503:
+                wait = 5 * (attempt + 1)
+                print(f"  Service unavailable (503), waiting {wait}s...")
+                time.sleep(wait)
+                continue
+
             resp.raise_for_status()
             return resp.json()
 
@@ -187,6 +193,12 @@ def fetch_streaming_links(link: str) -> dict | None:
             if resp.status_code == 429:
                 wait = 2 ** (attempt + 1)
                 print(f"  Rate limited on unrestrict, waiting {wait}s...")
+                time.sleep(wait)
+                continue
+
+            if resp.status_code == 503:
+                wait = 5 * (attempt + 1)
+                print(f"  Unrestrict service unavailable (503), waiting {wait}s...")
                 time.sleep(wait)
                 continue
 
@@ -492,6 +504,7 @@ def build_library():
             # Get streaming links
             links_list = info.get("links", [])
             streaming_links = []
+            unrestrict_failed = False
             for link in links_list:
                 print(f"    Unrestricting link...")
                 result = fetch_streaming_links(link)
@@ -502,6 +515,15 @@ def build_library():
                         "download": result["download"],
                         "mimetype": result.get("mimeType", ""),
                     })
+                else:
+                    unrestrict_failed = True
+
+            # If unrestricting failed and we have cached links, reuse them
+            if unrestrict_failed and not streaming_links and cached:
+                old_entry = cached.get("_library_entry", {})
+                streaming_links = old_entry.get("links", [])
+                if streaming_links:
+                    print(f"    Using {len(streaming_links)} cached links (unrestrict unavailable)")
 
             # Match streaming links to episodes where possible
             if is_pack and streaming_links:
