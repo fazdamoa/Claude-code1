@@ -1,6 +1,10 @@
 name: Update Torrent Library
 
 on:
+  push:
+    branches:
+      - main
+      - claude/torrent-library-site-W98ie
   schedule:
     # Runs daily at 04:00 UTC - adjust to your preferred time
     - cron: "0 4 * * *"
