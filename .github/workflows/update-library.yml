@@ -13,6 +13,11 @@ on:
 permissions:
   contents: write
 
+# Only one run at a time -- prevents overlapping API calls to Real-Debrid
+concurrency:
+  group: update-library
+  cancel-in-progress: true
+
 jobs:
   update:
     runs-on: ubuntu-latest
