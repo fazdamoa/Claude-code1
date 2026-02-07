@@ -1,14 +1,19 @@
 /**
  * Main application logic for the Torrent Library.
  * Handles login, data loading, search, filtering, and UI rendering.
+ * Unrestricts RD links on-demand when user clicks play/copy.
  */
 const App = (() => {
   // State
   let library = null;       // Decrypted library data
+  let rdKey = null;          // RD API key from encrypted blob
   let searchIndex = [];      // Precomputed search text for each item
   let filteredItems = [];    // Current filtered/search results
   let currentView = "grid";  // "grid" or "list"
   let currentFilter = "all"; // "all", "movie", "tv"
+
+  // Cache for unrestricted URLs (raw_link -> stream_url)
+  const unrestrictCache = {};
 
   // DOM refs
   const $ = (sel) => document.querySelector(sel);
@@ -17,19 +22,16 @@ const App = (() => {
   // ---- Initialization ----
 
   function init() {
-    // Check for existing session
     const savedPassword = Crypto.getSession();
     if (savedPassword) {
       attemptLogin(savedPassword, true);
     }
 
-    // Bind events
     $("#login-form").addEventListener("submit", onLoginSubmit);
     $("#search-input").addEventListener("input", debounce(onSearch, 150));
     $(".modal-overlay").addEventListener("click", onModalOverlayClick);
     $(".modal-close").addEventListener("click", closeModal);
 
-    // Filter buttons
     $$(".filter-btn").forEach((btn) => {
       btn.addEventListener("click", () => {
         currentFilter = btn.dataset.filter;
@@ -39,7 +41,6 @@ const App = (() => {
       });
     });
 
-    // View toggle
     $$(".view-toggle button").forEach((btn) => {
       btn.addEventListener("click", () => {
         currentView = btn.dataset.view;
@@ -49,10 +50,8 @@ const App = (() => {
       });
     });
 
-    // Logout
     $(".btn-logout").addEventListener("click", logout);
 
-    // Keyboard shortcuts
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") closeModal();
       if (e.key === "/" && !e.ctrlKey && !e.metaKey) {
@@ -77,7 +76,6 @@ const App = (() => {
     btn.textContent = "Decrypting...";
     $(".login-error").style.display = "none";
 
-    // Small delay so the UI updates
     await sleep(50);
     await attemptLogin(password, false);
 
@@ -87,7 +85,6 @@ const App = (() => {
 
   async function attemptLogin(password, isSession) {
     try {
-      // Fetch encrypted library
       const resp = await fetch("data/library.enc");
       if (!resp.ok) {
         if (!isSession) showLoginError("Library data not found. Has the GitHub Action run yet?");
@@ -95,18 +92,15 @@ const App = (() => {
       }
       const encryptedData = await resp.text();
 
-      // Decrypt
       const jsonStr = await Crypto.decrypt(encryptedData.trim(), password);
       library = JSON.parse(jsonStr);
+      rdKey = library.rd_key || null;
 
-      // Save session
       Crypto.saveSession(password);
 
-      // Build search index
       searchIndex = library.items.map((item) => Parser.searchText(item));
       filteredItems = [...library.items];
 
-      // Show app
       $(".login-container").style.display = "none";
       $(".app-container").classList.add("active");
 
@@ -116,7 +110,6 @@ const App = (() => {
 
     } catch (err) {
       if (isSession) {
-        // Session expired or data changed, clear session
         Crypto.clearSession();
         return;
       }
@@ -134,6 +127,7 @@ const App = (() => {
   function logout() {
     Crypto.clearSession();
     library = null;
+    rdKey = null;
     searchIndex = [];
     filteredItems = [];
     $(".app-container").classList.remove("active");
@@ -155,13 +149,8 @@ const App = (() => {
     const items = library.items;
 
     filteredItems = items.filter((item, i) => {
-      // Type filter
       if (currentFilter !== "all" && item.type !== currentFilter) return false;
-
-      // Search
-      if (query) {
-        return searchIndex[i].includes(query);
-      }
+      if (query) return searchIndex[i].includes(query);
       return true;
     });
 
@@ -280,51 +269,47 @@ const App = (() => {
     const modal = $(".modal");
     const title = Parser.displayTitle(item);
 
-    // Backdrop
     const backdropHtml = item.tmdb?.backdrop
       ? `<img class="modal-backdrop" src="${escapeAttr(item.tmdb.backdrop)}" alt="">`
       : `<div class="modal-backdrop-placeholder"></div>`;
 
-    // Poster
     const posterHtml = item.tmdb?.poster
       ? `<img src="${escapeAttr(item.tmdb.poster)}" alt="">`
       : "";
 
-    // Meta line
     const metaParts = [];
     if (item.tmdb?.year || item.year) metaParts.push(item.tmdb?.year || item.year);
     if (item.tmdb?.rating) metaParts.push(`&#9733; ${item.tmdb.rating.toFixed(1)}`);
     metaParts.push(Parser.formatSize(item.size));
     metaParts.push(Parser.formatDate(item.added));
 
-    // Genres
     const genresHtml = (item.tmdb?.genres || [])
       .map((g) => `<span class="genre-tag">${escapeHtml(g)}</span>`)
       .join("");
 
-    // Overview
     const overview = item.tmdb?.overview || "";
 
-    // Files / episodes
+    // Build file/link list
+    // raw_links are RD hoster URLs that need unrestricting on-demand
+    const rawLinks = item.raw_links || [];
     let filesHtml = "";
 
-    if (item.is_pack && item.episodes?.length) {
+    if (rawLinks.length > 0) {
+      const label = item.is_pack ? "Collection" : "Files";
+      const count = rawLinks.length > 1 ? ` (${rawLinks.length})` : "";
       filesHtml = `
-        <div class="modal-section-title">Episodes / Files (${item.episodes.length})</div>
-        <div class="modal-file-list">
-          ${item.episodes.map((ep) => {
-            const label = Parser.episodeLabel(ep);
-            const url = ep.stream_url || "";
-            return fileItemHtml(label, ep.size, url);
-          }).join("")}
-        </div>`;
-    } else if (item.links?.length) {
-      filesHtml = `
-        <div class="modal-section-title">Files</div>
-        <div class="modal-file-list">
-          ${item.links.map((link) => {
-            const label = link.filename || item.filename || "File";
-            return fileItemHtml(label, link.filesize, link.download);
+        <div class="modal-section-title">${label}${count}</div>
+        <div class="modal-file-list" id="modal-files">
+          ${rawLinks.map((link, idx) => {
+            // Use a safe data attribute to pass the link
+            return `
+              <div class="file-item" data-raw-link="${escapeAttr(link)}" data-idx="${idx}">
+                <span class="file-label">${item.is_pack ? `File ${idx + 1}` : escapeHtml(item.filename)}</span>
+                <div class="file-actions">
+                  <button class="btn-copy" onclick="App.unrestrictAndCopy(this); event.stopPropagation();">Copy URL</button>
+                  <button class="btn-vlc" onclick="App.unrestrictAndPlay(this); event.stopPropagation();">VLC</button>
+                </div>
+              </div>`;
           }).join("")}
         </div>`;
     }
@@ -353,21 +338,6 @@ const App = (() => {
     document.body.style.overflow = "hidden";
   }
 
-  function fileItemHtml(label, size, url) {
-    const hasUrl = !!url;
-    return `
-      <div class="file-item">
-        <span class="file-label" title="${escapeAttr(label)}">${escapeHtml(label)}</span>
-        <span class="file-size">${Parser.formatSize(size)}</span>
-        <div class="file-actions">
-          ${hasUrl ? `
-            <button class="btn-copy" onclick="App.copyUrl(this, '${escapeAttr(url)}'); event.stopPropagation();">Copy URL</button>
-            <a class="btn-vlc" href="${escapeAttr(Parser.vlcUrl(url))}" onclick="event.stopPropagation();">VLC</a>
-          ` : `<span style="color:var(--text-muted);font-size:0.8rem;">No link</span>`}
-        </div>
-      </div>`;
-  }
-
   function closeModal() {
     $(".modal-overlay").classList.remove("active");
     document.body.style.overflow = "";
@@ -379,26 +349,111 @@ const App = (() => {
     }
   }
 
-  // ---- Actions ----
+  // ---- On-demand unrestricting ----
 
-  async function copyUrl(btn, url) {
+  async function unrestrictLink(rawLink) {
+    // Return cached result if available
+    if (unrestrictCache[rawLink]) return unrestrictCache[rawLink];
+
+    if (!rdKey) throw new Error("No RD API key available");
+
+    const resp = await fetch("https://api.real-debrid.com/rest/1.0/unrestrict/link", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${rdKey}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: `link=${encodeURIComponent(rawLink)}`,
+    });
+
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(`RD API ${resp.status}: ${text}`);
+    }
+
+    const data = await resp.json();
+    const streamUrl = data.download;
+    if (!streamUrl) throw new Error("No download URL in response");
+
+    unrestrictCache[rawLink] = streamUrl;
+    return streamUrl;
+  }
+
+  function getRawLinkFromButton(btn) {
+    const fileItem = btn.closest(".file-item");
+    return fileItem?.dataset?.rawLink;
+  }
+
+  async function unrestrictAndCopy(btn) {
+    const rawLink = getRawLinkFromButton(btn);
+    if (!rawLink) return;
+
+    const origText = btn.textContent;
+    btn.textContent = "Loading...";
+    btn.disabled = true;
+
     try {
-      await navigator.clipboard.writeText(url);
+      const streamUrl = await unrestrictLink(rawLink);
+      await clipboardWrite(streamUrl);
+      btn.textContent = "Copied!";
+      btn.classList.add("copied");
+      showToast("Streaming URL copied to clipboard");
+      setTimeout(() => {
+        btn.textContent = origText;
+        btn.classList.remove("copied");
+        btn.disabled = false;
+      }, 2000);
+    } catch (err) {
+      console.error("Unrestrict failed:", err);
+      btn.textContent = "Error";
+      showToast(`Failed: ${err.message}`);
+      setTimeout(() => {
+        btn.textContent = origText;
+        btn.disabled = false;
+      }, 3000);
+    }
+  }
+
+  async function unrestrictAndPlay(btn) {
+    const rawLink = getRawLinkFromButton(btn);
+    if (!rawLink) return;
+
+    const origText = btn.textContent;
+    btn.textContent = "Loading...";
+    btn.disabled = true;
+
+    try {
+      const streamUrl = await unrestrictLink(rawLink);
+      window.location.href = Parser.vlcUrl(streamUrl);
+      btn.textContent = "Opened!";
+      setTimeout(() => {
+        btn.textContent = origText;
+        btn.disabled = false;
+      }, 2000);
+    } catch (err) {
+      console.error("Unrestrict failed:", err);
+      btn.textContent = "Error";
+      showToast(`Failed: ${err.message}`);
+      setTimeout(() => {
+        btn.textContent = origText;
+        btn.disabled = false;
+      }, 3000);
+    }
+  }
+
+  // ---- Utilities ----
+
+  async function clipboardWrite(text) {
+    try {
+      await navigator.clipboard.writeText(text);
     } catch {
       const ta = document.createElement("textarea");
-      ta.value = url;
+      ta.value = text;
       document.body.appendChild(ta);
       ta.select();
       document.execCommand("copy");
       document.body.removeChild(ta);
     }
-    btn.textContent = "Copied!";
-    btn.classList.add("copied");
-    showToast("URL copied to clipboard");
-    setTimeout(() => {
-      btn.textContent = "Copy URL";
-      btn.classList.remove("copied");
-    }, 2000);
   }
 
   function showToast(msg) {
@@ -407,8 +462,6 @@ const App = (() => {
     toast.classList.add("show");
     setTimeout(() => toast.classList.remove("show"), 2500);
   }
-
-  // ---- Utilities ----
 
   function debounce(fn, ms) {
     let timer;
@@ -424,8 +477,7 @@ const App = (() => {
 
   function escapeHtml(str) {
     if (!str) return "";
-    const s = String(str);
-    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
 
   function escapeAttr(str) {
@@ -434,7 +486,7 @@ const App = (() => {
   }
 
   // Public API
-  return { init, openDetail, closeModal, copyUrl };
+  return { init, openDetail, closeModal, unrestrictAndCopy, unrestrictAndPlay };
 })();
 
 // Boot

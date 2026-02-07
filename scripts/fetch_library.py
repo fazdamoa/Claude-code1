@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 Fetches torrent library from Real-Debrid, optionally enriches with TMDB metadata,
-encrypts everything, and writes to data/library.enc.
+encrypts everything, and writes to docs/data/library.enc.
 
-Supports incremental updates via an encrypted cache file.
+This script ONLY fetches the paginated torrent list -- no per-torrent info calls,
+no unrestricting. Unrestricting happens on-demand in the browser.
 
 Environment variables:
     RD_API_KEY           - Real-Debrid API token (required)
@@ -11,6 +12,7 @@ Environment variables:
     TMDB_API_KEY         - TMDB API key for metadata (optional)
 """
 
+import base64
 import hashlib
 import json
 import os
@@ -18,7 +20,6 @@ import re
 import secrets
 import sys
 import time
-from urllib.parse import quote
 
 import requests
 
@@ -38,17 +39,12 @@ CACHE_DIR = os.path.join(ROOT_DIR, "data")  # Cache stays outside docs/ (not ser
 LIBRARY_PATH = os.path.join(DATA_DIR, "library.enc")
 CACHE_PATH = os.path.join(CACHE_DIR, "cache.enc")
 
-RD_RATE_DELAY = 0.3  # seconds between RD API calls (concurrency group prevents overlapping runs)
-TMDB_RATE_DELAY = 0.1  # seconds between TMDB API calls
-MAX_RETRIES = 5
-
-# Adaptive rate limiting: after a 503, increase delay for subsequent requests
-_rd_current_delay = RD_RATE_DELAY
+RD_RATE_DELAY = 0.5  # seconds between RD API calls
+TMDB_RATE_DELAY = 0.1
+MAX_RETRIES = 4
 
 # ---------------------------------------------------------------------------
-# Encryption helpers (AES-256-GCM via PyCryptodome-compatible pure approach)
-# We use hashlib + os.urandom and the cryptography library for AES-GCM.
-# Falls back to a simpler approach if cryptography isn't available.
+# Encryption (AES-256-GCM)
 # ---------------------------------------------------------------------------
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -57,122 +53,72 @@ try:
     HAS_CRYPTO = True
 except ImportError:
     HAS_CRYPTO = False
-
-# Fallback: use AES-GCM via the built-in hashlib + a pure-python or
-# subprocess approach. But for GitHub Actions, we'll install cryptography.
-if not HAS_CRYPTO:
     print("WARNING: 'cryptography' package not found. Install with: pip install cryptography")
-    print("Attempting fallback...")
 
 
 def derive_key(password: str, salt: bytes) -> bytes:
-    """Derive a 256-bit key from password using PBKDF2-SHA256."""
     if HAS_CRYPTO:
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=600_000,
-        )
+        kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600_000)
         return kdf.derive(password.encode("utf-8"))
     else:
         return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 600_000)
 
 
 def encrypt_data(plaintext: str, password: str) -> bytes:
-    """Encrypt plaintext with AES-256-GCM. Returns: salt(16) + nonce(12) + ciphertext+tag."""
     salt = secrets.token_bytes(16)
     key = derive_key(password, salt)
     nonce = secrets.token_bytes(12)
-
     if HAS_CRYPTO:
-        aesgcm = AESGCM(key)
-        ct = aesgcm.encrypt(nonce, plaintext.encode("utf-8"), None)
+        ct = AESGCM(key).encrypt(nonce, plaintext.encode("utf-8"), None)
     else:
-        # Fallback using openssl subprocess
-        import subprocess
-        import tempfile
-        with tempfile.NamedTemporaryFile(delete=False) as f:
-            f.write(plaintext.encode("utf-8"))
-            tmp = f.name
-        try:
-            result = subprocess.run(
-                ["openssl", "enc", "-aes-256-gcm", "-nosalt",
-                 "-K", key.hex(), "-iv", nonce.hex()],
-                input=plaintext.encode("utf-8"),
-                capture_output=True
-            )
-            ct = result.stdout
-        finally:
-            os.unlink(tmp)
-
+        raise RuntimeError("Encryption requires the 'cryptography' package")
     return salt + nonce + ct
 
 
 def decrypt_data(data: bytes, password: str) -> str:
-    """Decrypt AES-256-GCM encrypted data."""
-    salt = data[:16]
-    nonce = data[16:28]
-    ct = data[28:]
+    salt, nonce, ct = data[:16], data[16:28], data[28:]
     key = derive_key(password, salt)
-
     if HAS_CRYPTO:
-        aesgcm = AESGCM(key)
-        plaintext = aesgcm.decrypt(nonce, ct, None)
-        return plaintext.decode("utf-8")
-    else:
-        raise RuntimeError("Decryption requires the 'cryptography' package")
+        return AESGCM(key).decrypt(nonce, ct, None).decode("utf-8")
+    raise RuntimeError("Decryption requires the 'cryptography' package")
 
 
 # ---------------------------------------------------------------------------
 # Real-Debrid API
 # ---------------------------------------------------------------------------
-def rd_request(endpoint: str, params: dict | None = None, retries: int = MAX_RETRIES) -> dict | list:
-    """Make a rate-limited, retry-aware request to the RD API."""
-    global _rd_current_delay
+def rd_get(endpoint: str, params: dict | None = None) -> dict | list:
+    """Rate-limited GET request to RD API with retries."""
     url = f"{RD_BASE}{endpoint}"
     headers = {"Authorization": f"Bearer {RD_API_KEY}"}
 
-    for attempt in range(retries):
+    for attempt in range(MAX_RETRIES):
+        time.sleep(RD_RATE_DELAY)
         try:
-            time.sleep(_rd_current_delay)
             resp = requests.get(url, headers=headers, params=params, timeout=30)
-
             if resp.status_code in (429, 503):
-                # Increase base delay for all future requests
-                _rd_current_delay = min(_rd_current_delay * 1.5, 10.0)
-                wait = 5 * (attempt + 1)
-                label = "Rate limited" if resp.status_code == 429 else "Service unavailable (503)"
-                print(f"  {label}, waiting {wait}s... (base delay now {_rd_current_delay:.1f}s)")
+                wait = 2 * (attempt + 1)
+                print(f"  {resp.status_code} on {endpoint}, waiting {wait}s...")
                 time.sleep(wait)
                 continue
-
-            # Successful request -- slowly ease the delay back down
-            _rd_current_delay = max(_rd_current_delay * 0.95, RD_RATE_DELAY)
-
             resp.raise_for_status()
             return resp.json()
-
         except requests.RequestException as e:
-            if attempt < retries - 1:
-                _rd_current_delay = min(_rd_current_delay * 1.5, 10.0)
-                wait = 2 ** (attempt + 1)
-                print(f"  Request error: {e}, retrying in {wait}s...")
+            if attempt < MAX_RETRIES - 1:
+                wait = 2 * (attempt + 1)
+                print(f"  Error: {e}, retrying in {wait}s...")
                 time.sleep(wait)
             else:
-                print(f"  Failed after {retries} attempts: {e}")
                 raise
-
     return {}
 
 
 def fetch_all_torrents() -> list[dict]:
-    """Fetch the full list of torrents (paginated)."""
+    """Fetch full torrent list (paginated)."""
     all_torrents = []
     page = 1
     while True:
-        print(f"  Fetching torrents page {page}...")
-        batch = rd_request("/torrents", params={"page": page, "limit": 100})
+        print(f"  Fetching page {page}...")
+        batch = rd_get("/torrents", params={"page": page, "limit": 100})
         if not batch:
             break
         all_torrents.extend(batch)
@@ -180,47 +126,6 @@ def fetch_all_torrents() -> list[dict]:
             break
         page += 1
     return all_torrents
-
-
-def fetch_torrent_info(torrent_id: str) -> dict:
-    """Fetch detailed info for a single torrent including file list."""
-    return rd_request(f"/torrents/info/{torrent_id}")
-
-
-def fetch_streaming_link(link: str) -> dict | None:
-    """Unrestrict a link to get a streaming URL."""
-    global _rd_current_delay
-    url = f"{RD_BASE}/unrestrict/link"
-    headers = {"Authorization": f"Bearer {RD_API_KEY}"}
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            time.sleep(_rd_current_delay)
-            resp = requests.post(url, headers=headers, data={"link": link}, timeout=30)
-
-            if resp.status_code in (429, 503):
-                _rd_current_delay = min(_rd_current_delay * 1.5, 10.0)
-                wait = 5 * (attempt + 1)
-                label = "Rate limited" if resp.status_code == 429 else "503"
-                print(f"    {label} on unrestrict, waiting {wait}s... (delay now {_rd_current_delay:.1f}s)")
-                time.sleep(wait)
-                continue
-
-            _rd_current_delay = max(_rd_current_delay * 0.95, RD_RATE_DELAY)
-            resp.raise_for_status()
-            return resp.json()
-
-        except requests.RequestException as e:
-            if attempt < MAX_RETRIES - 1:
-                _rd_current_delay = min(_rd_current_delay * 1.5, 10.0)
-                wait = 2 ** (attempt + 1)
-                print(f"    Unrestrict error: {e}, retrying in {wait}s...")
-                time.sleep(wait)
-            else:
-                print(f"    Unrestrict failed: {e}")
-                return None
-
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -234,19 +139,11 @@ QUALITY_TAGS = re.compile(
     re.IGNORECASE
 )
 
-RELEASE_GROUP = re.compile(r'[\-\s]*[\[\(]?[A-Za-z0-9]+[\]\)]?$')
-
 SEASON_EPISODE = re.compile(
-    r'[Ss](\d{1,2})[Ee](\d{1,3})'  # S01E01
-    r'|(\d{1,2})x(\d{1,3})'  # 1x01
-    r'|[Ss](\d{1,2})'  # S01 (full season)
-    r'|[Ss]eason[\.\s]?(\d{1,2})'  # Season 1
-)
-
-EPISODE_PATTERN = re.compile(
     r'[Ss](\d{1,2})[Ee](\d{1,3})'
     r'|(\d{1,2})x(\d{1,3})'
-    r'|[Ee](?:pisode)?[\.\s]?(\d{1,3})'
+    r'|[Ss](\d{1,2})'
+    r'|[Ss]eason[\.\s]?(\d{1,2})'
 )
 
 YEAR_PATTERN = re.compile(r'[\.\s\(]*((?:19|20)\d{2})[\.\s\)]*')
@@ -258,12 +155,10 @@ def parse_torrent_name(name: str) -> dict:
     """Parse a torrent name into structured metadata."""
     result = {"original": name}
 
-    # Extract year
     year_match = YEAR_PATTERN.search(name)
     if year_match:
         result["year"] = int(year_match.group(1))
 
-    # Detect season/episode info
     se_match = SEASON_EPISODE.search(name)
     if se_match:
         result["type"] = "tv"
@@ -280,70 +175,29 @@ def parse_torrent_name(name: str) -> dict:
     else:
         result["type"] = "movie"
 
-    # Clean name: everything before the quality tags / year / season info
     clean = name
-    # Remove file extension if present
     for ext in VIDEO_EXTENSIONS:
         if clean.lower().endswith(ext):
             clean = clean[:len(clean) - len(ext)]
             break
 
-    # Cut at first quality tag, year, or season marker
     for pattern in [QUALITY_TAGS, SEASON_EPISODE, YEAR_PATTERN]:
         m = pattern.search(clean)
         if m and m.start() > 0:
             clean = clean[:m.start()]
             break
 
-    # Replace dots and underscores with spaces, strip
     clean = re.sub(r'[\.\-_]', ' ', clean).strip()
-    # Remove trailing dash/spaces
     clean = re.sub(r'[\s\-]+$', '', clean)
     result["title"] = clean
 
     return result
 
 
-def parse_file_episodes(files: list[dict]) -> list[dict]:
-    """Parse episode info from individual files in a torrent."""
-    episodes = []
-    for f in files:
-        path = f.get("path", "")
-        name = os.path.basename(path)
-        ext = os.path.splitext(name)[1].lower()
-
-        if ext not in VIDEO_EXTENSIONS:
-            continue
-
-        ep_info = {"filename": name, "path": path, "size": f.get("bytes", 0)}
-
-        ep_match = EPISODE_PATTERN.search(name)
-        if ep_match:
-            if ep_match.group(1) and ep_match.group(2):
-                ep_info["season"] = int(ep_match.group(1))
-                ep_info["episode"] = int(ep_match.group(2))
-            elif ep_match.group(3) and ep_match.group(4):
-                ep_info["season"] = int(ep_match.group(3))
-                ep_info["episode"] = int(ep_match.group(4))
-            elif ep_match.group(5):
-                ep_info["episode"] = int(ep_match.group(5))
-
-        # Generate friendly episode name
-        parsed = parse_torrent_name(name)
-        ep_info["friendly_name"] = parsed["title"]
-
-        episodes.append(ep_info)
-
-    # Sort by season then episode
-    episodes.sort(key=lambda e: (e.get("season", 0), e.get("episode", 0)))
-    return episodes
-
-
 # ---------------------------------------------------------------------------
 # TMDB metadata (optional)
 # ---------------------------------------------------------------------------
 def tmdb_search(title: str, media_type: str = "movie", year: int | None = None) -> dict | None:
-    """Search TMDB for a title and return metadata."""
     if not TMDB_API_KEY:
         return None
 
@@ -358,17 +212,13 @@ def tmdb_search(title: str, media_type: str = "movie", year: int | None = None) 
         try:
             time.sleep(TMDB_RATE_DELAY)
             resp = requests.get(endpoint, params=params, timeout=15)
-
             if resp.status_code == 429:
                 time.sleep(2 ** (attempt + 1))
                 continue
-
             resp.raise_for_status()
-            data = resp.json()
-            results = data.get("results", [])
+            results = resp.json().get("results", [])
             if not results:
                 return None
-
             item = results[0]
             return {
                 "tmdb_id": item.get("id"),
@@ -380,16 +230,12 @@ def tmdb_search(title: str, media_type: str = "movie", year: int | None = None) 
                 "year": (item.get("release_date") or item.get("first_air_date") or "")[:4],
                 "genre_ids": item.get("genre_ids", []),
             }
-
         except requests.RequestException:
             if attempt < 2:
                 time.sleep(2)
-            continue
-
     return None
 
 
-# TMDB genre ID mapping
 TMDB_GENRES = {
     28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy", 80: "Crime",
     99: "Documentary", 18: "Drama", 10751: "Family", 14: "Fantasy", 36: "History",
@@ -404,35 +250,26 @@ TMDB_GENRES = {
 # Cache management
 # ---------------------------------------------------------------------------
 def load_cache() -> dict:
-    """Load existing cache from encrypted file."""
     if not os.path.exists(CACHE_PATH):
-        return {"torrents": {}, "tmdb_cache": {}}
-
+        return {"tmdb_cache": {}}
     try:
-        import base64
         with open(CACHE_PATH, "rb") as f:
-            encrypted = f.read()
-        plaintext = decrypt_data(encrypted, ENCRYPTION_PASSWORD)
-        return json.loads(plaintext)
+            return json.loads(decrypt_data(f.read(), ENCRYPTION_PASSWORD))
     except Exception as e:
         print(f"  Could not load cache: {e}")
-        return {"torrents": {}, "tmdb_cache": {}}
+        return {"tmdb_cache": {}}
 
 
 def save_cache(cache: dict):
-    """Save cache to encrypted file."""
-    plaintext = json.dumps(cache, separators=(',', ':'))
-    encrypted = encrypt_data(plaintext, ENCRYPTION_PASSWORD)
     os.makedirs(CACHE_DIR, exist_ok=True)
     with open(CACHE_PATH, "wb") as f:
-        f.write(encrypted)
+        f.write(encrypt_data(json.dumps(cache, separators=(',', ':')), ENCRYPTION_PASSWORD))
 
 
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 def build_library():
-    """Main function: fetch, enrich, encrypt, save."""
     if not RD_API_KEY:
         print("ERROR: RD_API_KEY environment variable is required")
         sys.exit(1)
@@ -442,113 +279,32 @@ def build_library():
 
     print("Loading cache...")
     cache = load_cache()
-    cached_torrents = cache.get("torrents", {})
     tmdb_cache = cache.get("tmdb_cache", {})
 
     print("Fetching torrent list from Real-Debrid...")
     rd_torrents = fetch_all_torrents()
     print(f"  Found {len(rd_torrents)} torrents")
 
-    # Build set of current torrent IDs
-    current_ids = {t["id"] for t in rd_torrents}
-
-    # Remove torrents that no longer exist in RD
-    removed = set(cached_torrents.keys()) - current_ids
-    for rid in removed:
-        del cached_torrents[rid]
-    if removed:
-        print(f"  Removed {len(removed)} deleted torrents from cache")
-
     library = []
-    new_count = 0
-    info_fetched = 0
 
-    for i, torrent in enumerate(rd_torrents):
-        tid = torrent["id"]
-        status = torrent.get("status", "")
-
-        # Only process downloaded torrents
-        if status != "downloaded":
+    for torrent in rd_torrents:
+        if torrent.get("status") != "downloaded":
             continue
 
-        # Parse name from the list data (no extra API call needed)
         parsed = parse_torrent_name(torrent.get("filename", ""))
-
-        # Store the raw RD links -- these will be unrestricted on-demand
-        # in the browser when the user actually wants to play something
         raw_links = torrent.get("links", [])
-
-        # For multi-file torrents (packs), we need /torrents/info to get
-        # the individual file list. Check cache first.
-        cached = cached_torrents.get(tid)
-        episodes = []
         is_pack = len(raw_links) > 1
-
-        if is_pack:
-            if cached and cached.get("episodes"):
-                # Reuse cached episode list (file structure doesn't change)
-                episodes = cached["episodes"]
-            else:
-                # Need to fetch file details -- this is the only per-torrent API call
-                print(f"  [{i+1}/{len(rd_torrents)}] Fetching file list for pack: {torrent.get('filename', tid)[:60]}...")
-                try:
-                    info = fetch_torrent_info(tid)
-                    info_fetched += 1
-                    files = info.get("files", [])
-                    selected_files = [f for f in files if f.get("selected") == 1]
-                    episodes = parse_file_episodes(selected_files)
-                except Exception as e:
-                    print(f"    Error fetching file info: {e}")
-
-        # Unrestrict links to get streaming URLs
-        # Check cache first -- only re-unrestrict if cached links are stale (>23h)
-        cached_links = cached.get("links", []) if cached else []
-        links_stale = (
-            not cached
-            or not cached_links
-            or cached.get("_fetched_at", 0) < time.time() - 82800  # 23 hours
-        )
-
-        streaming_links = []
-        if links_stale:
-            for link in raw_links:
-                result = fetch_streaming_link(link)
-                if result and result.get("download"):
-                    streaming_links.append({
-                        "filename": result.get("filename", ""),
-                        "filesize": result.get("filesize", 0),
-                        "download": result["download"],
-                        "mimetype": result.get("mimeType", ""),
-                    })
-                else:
-                    # If unrestrict fails, reuse cached link for this position
-                    idx = len(streaming_links)
-                    if idx < len(cached_links):
-                        streaming_links.append(cached_links[idx])
-        else:
-            streaming_links = cached_links
-
-        # Match streaming links to episodes where possible
-        if is_pack and streaming_links:
-            for ep in episodes:
-                ep_name = ep.get("filename", "").lower()
-                for sl in streaming_links:
-                    sl_name = sl.get("filename", "").lower()
-                    if sl_name and (sl_name in ep_name or ep_name in sl_name):
-                        ep["stream_url"] = sl["download"]
-                        break
 
         # TMDB metadata (cached across runs)
         tmdb_key = f"{parsed['title'].lower()}|{parsed.get('year', '')}|{parsed['type']}"
         tmdb_data = tmdb_cache.get(tmdb_key)
         if tmdb_data is None and TMDB_API_KEY:
-            print(f"    Searching TMDB for: {parsed['title']}...")
+            print(f"  TMDB lookup: {parsed['title']}...")
             tmdb_data = tmdb_search(parsed["title"], parsed["type"], parsed.get("year"))
-            tmdb_cache[tmdb_key] = tmdb_data  # Cache even None results
+            tmdb_cache[tmdb_key] = tmdb_data
 
-        # Build library entry
         entry = {
-            "id": tid,
+            "id": torrent["id"],
             "filename": torrent.get("filename", ""),
             "title": parsed["title"],
             "type": parsed["type"],
@@ -557,12 +313,10 @@ def build_library():
             "episode": parsed.get("episode"),
             "size": torrent.get("bytes", 0),
             "added": torrent.get("added", ""),
-            "links": streaming_links,
+            "raw_links": raw_links,
             "is_pack": is_pack,
-            "episodes": episodes if is_pack else [],
         }
 
-        # Add TMDB data if available
         if tmdb_data:
             entry["tmdb"] = {
                 "title": tmdb_data.get("title"),
@@ -575,36 +329,27 @@ def build_library():
             }
 
         library.append(entry)
-        new_count += 1
 
-        # Update cache
-        cached_torrents[tid] = {
-            "_fetched_at": time.time(),
-            "episodes": episodes,
-            "links": streaming_links,
-        }
+    print(f"\nLibrary built: {len(library)} torrents")
 
-    print(f"\nLibrary built: {len(library)} torrents ({info_fetched} pack info calls made)")
-
-    # Sort: most recently added first
     library.sort(key=lambda x: x.get("added", ""), reverse=True)
 
-    # Save cache
-    cache["torrents"] = cached_torrents
+    # Save TMDB cache
     cache["tmdb_cache"] = tmdb_cache
     save_cache(cache)
     print("Cache saved")
 
-    # Encrypt and save library (no API key needed -- all links pre-resolved)
+    # Encrypt and save library
+    # RD API key included so browser can unrestrict on-demand
     library_json = json.dumps({
-        "version": 3,
+        "version": 4,
         "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "rd_key": RD_API_KEY,
         "items": library,
     }, separators=(',', ':'))
     encrypted = encrypt_data(library_json, ENCRYPTION_PASSWORD)
 
     os.makedirs(DATA_DIR, exist_ok=True)
-    import base64
     with open(LIBRARY_PATH, "w") as f:
         f.write(base64.b64encode(encrypted).decode("ascii"))
 
