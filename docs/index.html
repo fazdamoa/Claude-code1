@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Torrent Library</title>
+  <link rel="stylesheet" href="css/style.css">
+  <!-- Prevent search engine indexing -->
+  <meta name="robots" content="noindex, nofollow">
+</head>
+<body>
+
+  <!-- Login Screen -->
+  <div class="login-container">
+    <div class="login-box">
+      <h1>Torrent Library</h1>
+      <p>Enter your password to decrypt and access your library.</p>
+      <form id="login-form">
+        <div class="input-group">
+          <input type="password" id="password-input" placeholder="Password" autocomplete="current-password" autofocus>
+        </div>
+        <button type="submit" id="login-btn">Unlock</button>
+      </form>
+      <p class="login-error"></p>
+    </div>
+  </div>
+
+  <!-- Main App (hidden until login) -->
+  <div class="app-container">
+
+    <!-- Toolbar -->
+    <div class="toolbar">
+      <h1>Torrent Library</h1>
+
+      <div class="search-box">
+        <span class="search-icon">&#128270;</span>
+        <input type="text" id="search-input" placeholder='Search movies, shows, episodes...  (press "/" to focus)'>
+      </div>
+
+      <div class="filter-group">
+        <button class="filter-btn active" data-filter="all">All</button>
+        <button class="filter-btn" data-filter="movie">Movies</button>
+        <button class="filter-btn" data-filter="tv">TV Shows</button>
+      </div>
+
+      <div class="view-toggle">
+        <button class="active" data-view="grid" title="Grid view">&#9638;</button>
+        <button data-view="list" title="List view">&#9776;</button>
+      </div>
+
+      <div class="toolbar-right">
+        <span class="stats"></span>
+        <button class="btn-logout">Logout</button>
+      </div>
+    </div>
+
+    <!-- Library Grid View -->
+    <div class="library-grid active">
+      <div class="loading" style="grid-column: 1 / -1;">
+        <div class="spinner"></div>
+        <p>Loading library...</p>
+      </div>
+    </div>
+
+    <!-- Library List View -->
+    <div class="library-list"></div>
+
+    <!-- Footer -->
+    <div class="last-updated"></div>
+  </div>
+
+  <!-- Detail Modal -->
+  <div class="modal-overlay">
+    <div class="modal">
+      <div class="modal-header"></div>
+      <div class="modal-body"></div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div class="toast"></div>
+
+  <!-- Scripts -->
+  <script src="js/crypto.js"></script>
+  <script src="js/parser.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+name: Update Torrent Library
+
+on:
+  schedule:
+    # Runs daily at 04:00 UTC - adjust to your preferred time
+    - cron: "0 4 * * *"
+  workflow_dispatch:  # Allow manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests cryptography
+
+      - name: Fetch and encrypt library
+        env:
+          RD_API_KEY: ${{ secrets.RD_API_KEY }}
+          ENCRYPTION_PASSWORD: ${{ secrets.ENCRYPTION_PASSWORD }}
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+        run: python scripts/fetch_library.py
+
+      - name: Commit and push updated library
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/library.enc data/cache.enc
+          # Only commit if there are changes
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update torrent library [automated]"
+            git push
+          fi
