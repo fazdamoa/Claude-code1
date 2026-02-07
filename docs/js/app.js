@@ -5,6 +5,7 @@
 const App = (() => {
   // State
   let library = null;       // Decrypted library data
+  let rdKey = null;          // RD API key (from encrypted blob)
   let searchIndex = [];      // Precomputed search text for each item
   let filteredItems = [];    // Current filtered/search results
   let currentView = "grid";  // "grid" or "list"
@@ -97,7 +98,9 @@ const App = (() => {
 
       // Decrypt
       const jsonStr = await Crypto.decrypt(encryptedData.trim(), password);
-      library = JSON.parse(jsonStr);
+      const data = JSON.parse(jsonStr);
+      library = data;
+      rdKey = data.rd_key || null;
 
       // Save session
       Crypto.saveSession(password);
@@ -134,6 +137,7 @@ const App = (() => {
   function logout() {
     Crypto.clearSession();
     library = null;
+    rdKey = null;
     searchIndex = [];
     filteredItems = [];
     $(".app-container").classList.remove("active");
@@ -306,24 +310,30 @@ const App = (() => {
     const overview = item.tmdb?.overview || "";
 
     // Files / episodes
+    // raw_links are RD hoster links that need unrestricting on-demand
+    const rawLinks = item.raw_links || [];
     let filesHtml = "";
+
     if (item.is_pack && item.episodes?.length) {
+      // Show episodes -- each gets a "Play" button that unrestricts the matching link
       filesHtml = `
-        <div class="modal-section-title">Episodes / Files</div>
+        <div class="modal-section-title">Episodes / Files (${item.episodes.length})</div>
         <div class="modal-file-list">
-          ${item.episodes.map((ep) => {
+          ${item.episodes.map((ep, epIdx) => {
             const label = Parser.episodeLabel(ep);
-            const url = ep.stream_url || "";
-            return fileItemHtml(label, ep.size, url);
+            // Try to match episode to a raw link by index
+            const linkIdx = Math.min(epIdx, rawLinks.length - 1);
+            const rawLink = rawLinks[linkIdx] || "";
+            return fileItemHtml(label, ep.size, rawLink);
           }).join("")}
         </div>`;
-    } else if (item.links?.length) {
+    } else if (rawLinks.length) {
       filesHtml = `
         <div class="modal-section-title">Files</div>
         <div class="modal-file-list">
-          ${item.links.map((link) => {
-            const label = link.filename || "Download";
-            return fileItemHtml(label, link.filesize, link.download);
+          ${rawLinks.map((link, linkIdx) => {
+            const label = item.filename || "File";
+            return fileItemHtml(label, linkIdx === 0 ? item.size : 0, link);
           }).join("")}
         </div>`;
     }
@@ -352,16 +362,17 @@ const App = (() => {
     document.body.style.overflow = "hidden";
   }
 
-  function fileItemHtml(label, size, url) {
-    const hasUrl = !!url;
+  function fileItemHtml(label, size, rawLink) {
+    const hasLink = !!rawLink;
+    // rawLink is an RD hoster link that needs unrestricting before use
     return `
       <div class="file-item">
         <span class="file-label" title="${escapeAttr(label)}">${escapeHtml(label)}</span>
         <span class="file-size">${Parser.formatSize(size)}</span>
         <div class="file-actions">
-          ${hasUrl ? `
-            <button class="btn-copy" onclick="App.copyUrl(this, '${escapeAttr(url)}'); event.stopPropagation();">Copy URL</button>
-            <a class="btn-vlc" href="${escapeAttr(Parser.vlcUrl(url))}" onclick="event.stopPropagation();">VLC</a>
+          ${hasLink ? `
+            <button class="btn-copy" onclick="App.unrestrictAndCopy(this, '${escapeAttr(rawLink)}'); event.stopPropagation();">Copy URL</button>
+            <button class="btn-vlc" onclick="App.unrestrictAndPlay(this, '${escapeAttr(rawLink)}'); event.stopPropagation();">VLC</button>
           ` : `<span style="color:var(--text-muted);font-size:0.8rem;">No link</span>`}
         </div>
       </div>`;
@@ -378,33 +389,93 @@ const App = (() => {
     }
   }
 
-  // ---- Actions ----
+  // ---- On-demand unrestricting ----
 
-  async function copyUrl(btn, url) {
+  // Cache unrestricted URLs so we don't re-call for the same link
+  const _unrestrictCache = {};
+
+  async function unrestrictLink(rawLink) {
+    if (_unrestrictCache[rawLink]) return _unrestrictCache[rawLink];
+
+    if (!rdKey) throw new Error("No API key available");
+
+    const resp = await fetch("https://api.real-debrid.com/rest/1.0/unrestrict/link", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${rdKey}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: `link=${encodeURIComponent(rawLink)}`,
+    });
+
+    if (!resp.ok) throw new Error(`RD API error: ${resp.status}`);
+
+    const data = await resp.json();
+    const streamUrl = data.download;
+    if (streamUrl) _unrestrictCache[rawLink] = streamUrl;
+    return streamUrl;
+  }
+
+  async function unrestrictAndCopy(btn, rawLink) {
+    const origText = btn.textContent;
+    btn.textContent = "Loading...";
+    btn.disabled = true;
+
     try {
-      await navigator.clipboard.writeText(url);
+      const streamUrl = await unrestrictLink(rawLink);
+      await clipboardWrite(streamUrl);
       btn.textContent = "Copied!";
       btn.classList.add("copied");
-      showToast("URL copied to clipboard");
+      showToast("Streaming URL copied to clipboard");
       setTimeout(() => {
-        btn.textContent = "Copy URL";
+        btn.textContent = origText;
         btn.classList.remove("copied");
+        btn.disabled = false;
       }, 2000);
+    } catch (err) {
+      btn.textContent = "Error";
+      showToast(`Failed: ${err.message}`);
+      setTimeout(() => {
+        btn.textContent = origText;
+        btn.disabled = false;
+      }, 2000);
+    }
+  }
+
+  async function unrestrictAndPlay(btn, rawLink) {
+    const origText = btn.textContent;
+    btn.textContent = "Loading...";
+    btn.disabled = true;
+
+    try {
+      const streamUrl = await unrestrictLink(rawLink);
+      // Open VLC via protocol handler
+      window.location.href = Parser.vlcUrl(streamUrl);
+      btn.textContent = "Opened!";
+      setTimeout(() => {
+        btn.textContent = origText;
+        btn.disabled = false;
+      }, 2000);
+    } catch (err) {
+      btn.textContent = "Error";
+      showToast(`Failed: ${err.message}`);
+      setTimeout(() => {
+        btn.textContent = origText;
+        btn.disabled = false;
+      }, 2000);
+    }
+  }
+
+  async function clipboardWrite(text) {
+    try {
+      await navigator.clipboard.writeText(text);
     } catch {
-      // Fallback
       const ta = document.createElement("textarea");
-      ta.value = url;
+      ta.value = text;
       document.body.appendChild(ta);
       ta.select();
       document.execCommand("copy");
       document.body.removeChild(ta);
-      btn.textContent = "Copied!";
-      btn.classList.add("copied");
-      showToast("URL copied to clipboard");
-      setTimeout(() => {
-        btn.textContent = "Copy URL";
-        btn.classList.remove("copied");
-      }, 2000);
     }
   }
 
@@ -441,7 +512,7 @@ const App = (() => {
   }
 
   // Public API
-  return { init, openDetail, closeModal, copyUrl };
+  return { init, openDetail, closeModal, unrestrictAndCopy, unrestrictAndPlay };
 })();
 
 // Boot

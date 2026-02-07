@@ -185,43 +185,6 @@ def fetch_torrent_info(torrent_id: str) -> dict:
     return rd_request(f"/torrents/info/{torrent_id}")
 
 
-def fetch_streaming_links(link: str) -> dict | None:
-    """Unrestrict a link to get a streaming URL."""
-    global _rd_current_delay
-    url = f"{RD_BASE}/unrestrict/link"
-    headers = {"Authorization": f"Bearer {RD_API_KEY}"}
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            time.sleep(_rd_current_delay)
-            resp = requests.post(url, headers=headers, data={"link": link}, timeout=30)
-
-            if resp.status_code in (429, 503):
-                _rd_current_delay = min(_rd_current_delay * 1.5, 10.0)
-                wait = 5 * (attempt + 1)
-                label = "Rate limited" if resp.status_code == 429 else "Service unavailable (503)"
-                print(f"    {label} on unrestrict, waiting {wait}s... (base delay now {_rd_current_delay:.1f}s)")
-                time.sleep(wait)
-                continue
-
-            _rd_current_delay = max(_rd_current_delay * 0.95, RD_RATE_DELAY)
-
-            resp.raise_for_status()
-            return resp.json()
-
-        except requests.RequestException as e:
-            if attempt < MAX_RETRIES - 1:
-                _rd_current_delay = min(_rd_current_delay * 1.5, 10.0)
-                wait = 2 ** (attempt + 1)
-                print(f"    Unrestrict error: {e}, retrying in {wait}s...")
-                time.sleep(wait)
-            else:
-                print(f"    Unrestrict failed: {e}")
-                return None
-
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Torrent name parsing
 # ---------------------------------------------------------------------------
@@ -460,7 +423,7 @@ def build_library():
 
     library = []
     new_count = 0
-    refresh_count = 0
+    info_fetched = 0
 
     for i, torrent in enumerate(rd_torrents):
         tid = torrent["id"]
@@ -470,123 +433,81 @@ def build_library():
         if status != "downloaded":
             continue
 
-        # Check if we need to fetch detailed info
+        # Parse name from the list data (no extra API call needed)
+        parsed = parse_torrent_name(torrent.get("filename", ""))
+
+        # Store the raw RD links -- these will be unrestricted on-demand
+        # in the browser when the user actually wants to play something
+        raw_links = torrent.get("links", [])
+
+        # For multi-file torrents (packs), we need /torrents/info to get
+        # the individual file list. Check cache first.
         cached = cached_torrents.get(tid)
-        needs_refresh = (
-            cached is None
-            or cached.get("_fetched_at", 0) < time.time() - 82800  # 23 hours
-        )
+        episodes = []
+        is_pack = len(raw_links) > 1
 
-        if needs_refresh:
-            if cached is None:
-                new_count += 1
+        if is_pack:
+            if cached and cached.get("episodes"):
+                # Reuse cached episode list (file structure doesn't change)
+                episodes = cached["episodes"]
             else:
-                refresh_count += 1
+                # Need to fetch file details -- this is the only per-torrent API call
+                print(f"  [{i+1}/{len(rd_torrents)}] Fetching file list for pack: {torrent.get('filename', tid)[:60]}...")
+                try:
+                    info = fetch_torrent_info(tid)
+                    info_fetched += 1
+                    files = info.get("files", [])
+                    selected_files = [f for f in files if f.get("selected") == 1]
+                    episodes = parse_file_episodes(selected_files)
+                except Exception as e:
+                    print(f"    Error fetching file info: {e}")
 
-            print(f"  [{i+1}/{len(rd_torrents)}] Fetching info for: {torrent.get('filename', tid)[:60]}...")
+        # TMDB metadata (cached across runs)
+        tmdb_key = f"{parsed['title'].lower()}|{parsed.get('year', '')}|{parsed['type']}"
+        tmdb_data = tmdb_cache.get(tmdb_key)
+        if tmdb_data is None and TMDB_API_KEY:
+            print(f"    Searching TMDB for: {parsed['title']}...")
+            tmdb_data = tmdb_search(parsed["title"], parsed["type"], parsed.get("year"))
+            tmdb_cache[tmdb_key] = tmdb_data  # Cache even None results
 
-            try:
-                info = fetch_torrent_info(tid)
-            except Exception as e:
-                print(f"    Error fetching info: {e}")
-                if cached:
-                    # Use stale cache
-                    library.append(cached.get("_library_entry", {}))
-                continue
+        # Build library entry
+        entry = {
+            "id": tid,
+            "filename": torrent.get("filename", ""),
+            "title": parsed["title"],
+            "type": parsed["type"],
+            "year": parsed.get("year"),
+            "season": parsed.get("season"),
+            "episode": parsed.get("episode"),
+            "size": torrent.get("bytes", 0),
+            "added": torrent.get("added", ""),
+            "raw_links": raw_links,  # RD links to unrestrict on-demand in browser
+            "is_pack": is_pack,
+            "episodes": episodes if is_pack else [],
+        }
 
-            # Parse name
-            parsed = parse_torrent_name(torrent.get("filename", ""))
-
-            # Get files and episodes
-            files = info.get("files", [])
-            # Filter to selected files only
-            selected_files = [f for f in files if f.get("selected") == 1]
-            episodes = parse_file_episodes(selected_files)
-
-            # Determine if multi-episode
-            is_pack = len(episodes) > 1
-
-            # Get streaming links
-            links_list = info.get("links", [])
-            streaming_links = []
-            unrestrict_failed = False
-            for link in links_list:
-                print(f"    Unrestricting link...")
-                result = fetch_streaming_links(link)
-                if result and result.get("download"):
-                    streaming_links.append({
-                        "filename": result.get("filename", ""),
-                        "filesize": result.get("filesize", 0),
-                        "download": result["download"],
-                        "mimetype": result.get("mimeType", ""),
-                    })
-                else:
-                    unrestrict_failed = True
-
-            # If unrestricting failed and we have cached links, reuse them
-            if unrestrict_failed and not streaming_links and cached:
-                old_entry = cached.get("_library_entry", {})
-                streaming_links = old_entry.get("links", [])
-                if streaming_links:
-                    print(f"    Using {len(streaming_links)} cached links (unrestrict unavailable)")
-
-            # Match streaming links to episodes where possible
-            if is_pack and streaming_links:
-                for ep in episodes:
-                    ep_name = ep.get("filename", "").lower()
-                    for sl in streaming_links:
-                        if sl["filename"].lower() in ep_name or ep_name in sl["filename"].lower():
-                            ep["stream_url"] = sl["download"]
-                            break
-
-            # TMDB metadata
-            tmdb_key = f"{parsed['title'].lower()}|{parsed.get('year', '')}|{parsed['type']}"
-            tmdb_data = tmdb_cache.get(tmdb_key)
-            if tmdb_data is None and TMDB_API_KEY:
-                print(f"    Searching TMDB for: {parsed['title']}...")
-                tmdb_data = tmdb_search(parsed["title"], parsed["type"], parsed.get("year"))
-                tmdb_cache[tmdb_key] = tmdb_data  # Cache even None results
-
-            # Build library entry
-            entry = {
-                "id": tid,
-                "filename": torrent.get("filename", ""),
-                "title": parsed["title"],
-                "type": parsed["type"],
-                "year": parsed.get("year"),
-                "season": parsed.get("season"),
-                "episode": parsed.get("episode"),
-                "size": torrent.get("bytes", 0),
-                "added": torrent.get("added", ""),
-                "links": streaming_links,
-                "is_pack": is_pack,
-                "episodes": episodes if is_pack else [],
+        # Add TMDB data if available
+        if tmdb_data:
+            entry["tmdb"] = {
+                "title": tmdb_data.get("title"),
+                "overview": tmdb_data.get("overview"),
+                "poster": tmdb_data.get("poster"),
+                "backdrop": tmdb_data.get("backdrop"),
+                "rating": tmdb_data.get("rating"),
+                "year": tmdb_data.get("year"),
+                "genres": [TMDB_GENRES.get(gid, "") for gid in tmdb_data.get("genre_ids", []) if gid in TMDB_GENRES],
             }
 
-            # Add TMDB data if available
-            if tmdb_data:
-                entry["tmdb"] = {
-                    "title": tmdb_data.get("title"),
-                    "overview": tmdb_data.get("overview"),
-                    "poster": tmdb_data.get("poster"),
-                    "backdrop": tmdb_data.get("backdrop"),
-                    "rating": tmdb_data.get("rating"),
-                    "year": tmdb_data.get("year"),
-                    "genres": [TMDB_GENRES.get(gid, "") for gid in tmdb_data.get("genre_ids", []) if gid in TMDB_GENRES],
-                }
+        library.append(entry)
+        new_count += 1
 
-            library.append(entry)
+        # Update cache (mainly for episode lists of packs)
+        cached_torrents[tid] = {
+            "_fetched_at": time.time(),
+            "episodes": episodes,
+        }
 
-            # Update cache
-            cached_torrents[tid] = {
-                "_fetched_at": time.time(),
-                "_library_entry": entry,
-            }
-        else:
-            # Use cached entry
-            library.append(cached["_library_entry"])
-
-    print(f"\nLibrary built: {len(library)} torrents ({new_count} new, {refresh_count} refreshed)")
+    print(f"\nLibrary built: {len(library)} torrents ({info_fetched} pack info calls made)")
 
     # Sort: most recently added first
     library.sort(key=lambda x: x.get("added", ""), reverse=True)
@@ -598,7 +519,13 @@ def build_library():
     print("Cache saved")
 
     # Encrypt and save library
-    library_json = json.dumps({"version": 1, "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "items": library}, separators=(',', ':'))
+    # Include RD API key in the encrypted blob so the browser can unrestrict links on-demand
+    library_json = json.dumps({
+        "version": 2,
+        "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "rd_key": RD_API_KEY,
+        "items": library,
+    }, separators=(',', ':'))
     encrypted = encrypt_data(library_json, ENCRYPTION_PASSWORD)
 
     os.makedirs(DATA_DIR, exist_ok=True)
