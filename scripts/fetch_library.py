@@ -36,9 +36,12 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 LIBRARY_PATH = os.path.join(DATA_DIR, "library.enc")
 CACHE_PATH = os.path.join(DATA_DIR, "cache.enc")
 
-RD_RATE_DELAY = 0.3  # seconds between RD API calls
+RD_RATE_DELAY = 1.0  # seconds between RD API calls (RD returns 503 if too fast)
 TMDB_RATE_DELAY = 0.1  # seconds between TMDB API calls
-MAX_RETRIES = 4
+MAX_RETRIES = 5
+
+# Adaptive rate limiting: after a 503, increase delay for subsequent requests
+_rd_current_delay = RD_RATE_DELAY
 
 # ---------------------------------------------------------------------------
 # Encryption helpers (AES-256-GCM via PyCryptodome-compatible pure approach)
@@ -124,31 +127,33 @@ def decrypt_data(data: bytes, password: str) -> str:
 # ---------------------------------------------------------------------------
 def rd_request(endpoint: str, params: dict | None = None, retries: int = MAX_RETRIES) -> dict | list:
     """Make a rate-limited, retry-aware request to the RD API."""
+    global _rd_current_delay
     url = f"{RD_BASE}{endpoint}"
     headers = {"Authorization": f"Bearer {RD_API_KEY}"}
 
     for attempt in range(retries):
         try:
-            time.sleep(RD_RATE_DELAY)
+            time.sleep(_rd_current_delay)
             resp = requests.get(url, headers=headers, params=params, timeout=30)
 
-            if resp.status_code == 429:
-                wait = 2 ** (attempt + 1)
-                print(f"  Rate limited, waiting {wait}s...")
+            if resp.status_code in (429, 503):
+                # Increase base delay for all future requests
+                _rd_current_delay = min(_rd_current_delay * 1.5, 10.0)
+                wait = 5 * (attempt + 1)
+                label = "Rate limited" if resp.status_code == 429 else "Service unavailable (503)"
+                print(f"  {label}, waiting {wait}s... (base delay now {_rd_current_delay:.1f}s)")
                 time.sleep(wait)
                 continue
 
-            if resp.status_code == 503:
-                wait = 5 * (attempt + 1)
-                print(f"  Service unavailable (503), waiting {wait}s...")
-                time.sleep(wait)
-                continue
+            # Successful request -- slowly ease the delay back down
+            _rd_current_delay = max(_rd_current_delay * 0.95, RD_RATE_DELAY)
 
             resp.raise_for_status()
             return resp.json()
 
         except requests.RequestException as e:
             if attempt < retries - 1:
+                _rd_current_delay = min(_rd_current_delay * 1.5, 10.0)
                 wait = 2 ** (attempt + 1)
                 print(f"  Request error: {e}, retrying in {wait}s...")
                 time.sleep(wait)
@@ -182,36 +187,36 @@ def fetch_torrent_info(torrent_id: str) -> dict:
 
 def fetch_streaming_links(link: str) -> dict | None:
     """Unrestrict a link to get a streaming URL."""
+    global _rd_current_delay
     url = f"{RD_BASE}/unrestrict/link"
     headers = {"Authorization": f"Bearer {RD_API_KEY}"}
 
     for attempt in range(MAX_RETRIES):
         try:
-            time.sleep(RD_RATE_DELAY)
+            time.sleep(_rd_current_delay)
             resp = requests.post(url, headers=headers, data={"link": link}, timeout=30)
 
-            if resp.status_code == 429:
-                wait = 2 ** (attempt + 1)
-                print(f"  Rate limited on unrestrict, waiting {wait}s...")
+            if resp.status_code in (429, 503):
+                _rd_current_delay = min(_rd_current_delay * 1.5, 10.0)
+                wait = 5 * (attempt + 1)
+                label = "Rate limited" if resp.status_code == 429 else "Service unavailable (503)"
+                print(f"    {label} on unrestrict, waiting {wait}s... (base delay now {_rd_current_delay:.1f}s)")
                 time.sleep(wait)
                 continue
 
-            if resp.status_code == 503:
-                wait = 5 * (attempt + 1)
-                print(f"  Unrestrict service unavailable (503), waiting {wait}s...")
-                time.sleep(wait)
-                continue
+            _rd_current_delay = max(_rd_current_delay * 0.95, RD_RATE_DELAY)
 
             resp.raise_for_status()
             return resp.json()
 
         except requests.RequestException as e:
             if attempt < MAX_RETRIES - 1:
+                _rd_current_delay = min(_rd_current_delay * 1.5, 10.0)
                 wait = 2 ** (attempt + 1)
-                print(f"  Unrestrict error: {e}, retrying in {wait}s...")
+                print(f"    Unrestrict error: {e}, retrying in {wait}s...")
                 time.sleep(wait)
             else:
-                print(f"  Unrestrict failed: {e}")
+                print(f"    Unrestrict failed: {e}")
                 return None
 
     return None
