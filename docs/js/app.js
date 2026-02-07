@@ -89,7 +89,7 @@ const App = (() => {
   async function attemptLogin(password, isSession) {
     try {
       // Fetch encrypted library
-      const resp = await fetch("../data/library.enc");
+      const resp = await fetch("data/library.enc");
       if (!resp.ok) {
         if (!isSession) showLoginError("Library data not found. Has the GitHub Action run yet?");
         return;

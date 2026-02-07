@@ -32,9 +32,11 @@ TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
 RD_BASE = "https://api.real-debrid.com/rest/1.0"
 TMDB_BASE = "https://api.themoviedb.org/3"
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(ROOT_DIR, "docs", "data")  # Inside docs/ so GitHub Pages serves it
+CACHE_DIR = os.path.join(ROOT_DIR, "data")  # Cache stays outside docs/ (not served)
 LIBRARY_PATH = os.path.join(DATA_DIR, "library.enc")
-CACHE_PATH = os.path.join(DATA_DIR, "cache.enc")
+CACHE_PATH = os.path.join(CACHE_DIR, "cache.enc")
 
 RD_RATE_DELAY = 1.0  # seconds between RD API calls (RD returns 503 if too fast)
 TMDB_RATE_DELAY = 0.1  # seconds between TMDB API calls
@@ -385,7 +387,7 @@ def save_cache(cache: dict):
     """Save cache to encrypted file."""
     plaintext = json.dumps(cache, separators=(',', ':'))
     encrypted = encrypt_data(plaintext, ENCRYPTION_PASSWORD)
-    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(CACHE_DIR, exist_ok=True)
     with open(CACHE_PATH, "wb") as f:
         f.write(encrypted)
 
