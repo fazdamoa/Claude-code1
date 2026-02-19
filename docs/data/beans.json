@@ -1,0 +1,17 @@
+[
+  {
+    "name": "Brazil Dark Roast",
+    "roaster": "13th Floor",
+    "origin": "Brazil",
+    "roast_level": "dark",
+    "grind_size": 15,
+    "dose_g": 19,
+    "yield_g": 38,
+    "time_s": 26,
+    "temp_c": "default",
+    "tasting_notes": [],
+    "rating": 5,
+    "notes": "Sage Barista Pro - temp set to default slider position.",
+    "date_added": "2026-02-19"
+  }
+]

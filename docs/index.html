@@ -3,86 +3,63 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Torrent Library</title>
+  <title>Espresso Dial-In Tracker</title>
   <link rel="stylesheet" href="css/style.css">
-  <!-- Prevent search engine indexing -->
-  <meta name="robots" content="noindex, nofollow">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 </head>
 <body>
+  <div class="bg-beans"></div>
 
-  <!-- Login Screen -->
-  <div class="login-container">
-    <div class="login-box">
-      <h1>Torrent Library</h1>
-      <p>Enter your password to decrypt and access your library.</p>
-      <form id="login-form">
-        <div class="input-group">
-          <input type="password" id="password-input" placeholder="Password" autocomplete="current-password" autofocus>
+  <header>
+    <div class="header-content">
+      <div class="logo">
+        <span class="logo-icon">&#9749;</span>
+        <div>
+          <h1>Dial-In Tracker</h1>
+          <p class="subtitle">Espresso settings &amp; recipes</p>
         </div>
-        <button type="submit" id="login-btn">Unlock</button>
-      </form>
-      <p class="login-error"></p>
+      </div>
+      <div class="header-stats" id="header-stats"></div>
     </div>
-  </div>
+  </header>
 
-  <!-- Main App (hidden until login) -->
-  <div class="app-container">
-
-    <!-- Toolbar -->
-    <div class="toolbar">
-      <h1>Torrent Library</h1>
-
+  <main>
+    <div class="controls">
       <div class="search-box">
-        <span class="search-icon">&#128270;</span>
-        <input type="text" id="search-input" placeholder='Search movies, shows, episodes...  (press "/" to focus)'>
+        <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+        </svg>
+        <input type="text" id="search" placeholder="Search beans, roaster, origin...">
       </div>
-
-      <div class="filter-group">
-        <button class="filter-btn active" data-filter="all">All</button>
-        <button class="filter-btn" data-filter="movie">Movies</button>
-        <button class="filter-btn" data-filter="tv">TV Shows</button>
-      </div>
-
-      <div class="view-toggle">
-        <button class="active" data-view="grid" title="Grid view">&#9638;</button>
-        <button data-view="list" title="List view">&#9776;</button>
-      </div>
-
-      <div class="toolbar-right">
-        <span class="stats"></span>
-        <button class="btn-logout">Logout</button>
-      </div>
+      <div class="filter-chips" id="filter-chips"></div>
     </div>
 
-    <!-- Library Grid View -->
-    <div class="library-grid active">
-      <div class="loading" style="grid-column: 1 / -1;">
-        <div class="spinner"></div>
-        <p>Loading library...</p>
+    <div class="beans-grid" id="beans-grid">
+      <div class="loading-state">
+        <div class="coffee-loader">
+          <div class="steam"></div>
+          <div class="steam"></div>
+          <div class="steam"></div>
+          <div class="cup"></div>
+        </div>
+        <p>Brewing your data...</p>
       </div>
     </div>
+  </main>
 
-    <!-- Library List View -->
-    <div class="library-list"></div>
-
-    <!-- Footer -->
-    <div class="last-updated"></div>
-  </div>
-
-  <!-- Detail Modal -->
-  <div class="modal-overlay">
-    <div class="modal">
-      <div class="modal-header"></div>
-      <div class="modal-body"></div>
+  <div class="modal-overlay" id="modal-overlay">
+    <div class="modal" id="bean-modal">
+      <button class="modal-close" id="modal-close">&times;</button>
+      <div class="modal-body" id="modal-body"></div>
     </div>
   </div>
 
-  <!-- Toast -->
-  <div class="toast"></div>
+  <footer>
+    <p>Made with <span class="coffee-heart">&#9749;</span> &mdash; Dial-In Tracker</p>
+  </footer>
 
-  <!-- Scripts -->
-  <script src="js/crypto.js"></script>
-  <script src="js/parser.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>
