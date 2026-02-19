@@ -204,7 +204,7 @@
           ${bean.temp_c ? `
           <div class="modal-param">
             <div class="modal-param-label">Temp</div>
-            <div class="modal-param-value">${bean.temp_c}<span class="modal-param-unit">&deg;C</span></div>
+            <div class="modal-param-value">${typeof bean.temp_c === 'number' ? bean.temp_c + '<span class="modal-param-unit">&deg;C</span>' : esc(String(bean.temp_c))}</div>
           </div>` : ''}
         </div>
       </div>
