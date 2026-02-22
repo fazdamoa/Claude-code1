@@ -291,6 +291,7 @@
       'jamaica': '\u{1F1EF}\u{1F1F2}',
       'tanzania': '\u{1F1F9}\u{1F1FF}',
       'nicaragua': '\u{1F1F3}\u{1F1EE}',
+      'uganda': '\u{1F1FA}\u{1F1EC}',
       'yemen': '\u{1F1FE}\u{1F1EA}',
       'blend': '\u{1F30D}',
     };

@@ -13,5 +13,20 @@
     "rating": 5,
     "notes": "Sage Barista Pro - temp set to default slider position.",
     "date_added": "2026-02-19"
+  },
+  {
+    "name": "Raw Power",
+    "roaster": "13th Floor x Elsewhere",
+    "origin": "Uganda",
+    "roast_level": "medium",
+    "grind_size": 10,
+    "dose_g": 19,
+    "yield_g": 38,
+    "time_s": 28,
+    "temp_c": "default",
+    "tasting_notes": ["Dried Apricot", "Pecan", "Fudge"],
+    "rating": 4,
+    "notes": "Natural process. Rwenzori Mountains, 1400-2000 MASL. Creamy & juicy.",
+    "date_added": "2026-02-22"
   }
 ]
